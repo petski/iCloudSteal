@@ -2,18 +2,17 @@
 # Source: https://github.com/thibaudbrg/iCloudSteal
 # Inspired by https://gist.github.com/fay59/8f719cd81967e0eb2234897491e051ec
 
-# Requirements: jq, curl, bc, md5sum
+# Requirements: jq, curl
 # Usage: See `show_help` function below for details.
 
 # Default values
 TARGET_FOLDER="./"
 APPLE_MME_HOST="p23-sharedstreams.icloud.com"
+CONCURRENT=1
 
 # Check for required commands
 command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
 command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
-command -v bc >/dev/null 2>&1 || { echo "bc is required" >&2; exit 1; }
-command -v md5sum >/dev/null 2>&1 || { echo "md5sum is required" >&2; exit 1; }
 
 # Validate URL format
 function validate_url() {
@@ -21,14 +20,6 @@ function validate_url() {
         echo "Invalid URL format" >&2
         exit 1
     fi
-}
-
-# Progress bar function
-function progress_bar() {
-    local current="${1}"
-    local total="${2}"
-
-    printf "Progress: %s%%\r" "$(echo "scale=2; 100 * ${current} / ${total}" | bc)"
 }
 
 # Fetch album metadata from iCloud shared album
@@ -133,9 +124,9 @@ show_help() {
     echo "This script allows you to download all photos from a shared iCloud album." >&2
     echo "You can specify the directory to save the photos." >&2
     echo -e "\nUsage:" >&2
-    echo "  ${0} --url <URL> [--folder <target folder>]" >&2
+    echo "  ${0} --url <URL> [--folder <target folder>] [--concurrent ${CONCURRENT}]" >&2
     echo -e "\nExample:" >&2
-    echo "  ${0} --url 'https://www.icloud.com/sharedalbum/#AAAAAAAAAAAAAAA' --folder ./downloads" >&2
+    echo "  ${0} --url 'https://www.icloud.com/sharedalbum/#AAAAAAAAAAAAAAA' --folder ./downloads --concurrent 25" >&2
 }
 
 # Parse arguments
@@ -143,6 +134,7 @@ while [[ "$#" -gt 0 ]]; do
     case "${1}" in
         "--url") URL="${2}"; shift ;;
         "--folder") TARGET_FOLDER="${2}"; shift ;;
+        "--concurrent") CONCURRENT="${2}"; shift ;;
         "--help" | "-h") show_help; exit 1 ;;
         *) echo "Unknown option: ${1}" >&2; show_help; exit 1 ;;
     esac
@@ -151,7 +143,7 @@ done
 
 # Check and validate
 if [[ -z "${URL}" ]]; then
-    echo "Syntax: ${0} --url <URL> [--folder <target folder>]" >&2
+    show_help
     exit 1;
 fi
 
@@ -170,63 +162,23 @@ show_metadata_summary "${METADATA}"
 HIGH_QUALITY_CHECKSUMS=$(get_uniq_high_quality_checksums "$METADATA")
 HIGH_QUALITY_CHECKSUM_FILE="album_${ALBUM_ID}_high_quality_checksums.txt"
 printf "%s\n" "${HIGH_QUALITY_CHECKSUMS}" > "${HIGH_QUALITY_CHECKSUM_FILE}"
+printf "%d high quality checksums saved to %s\n" "$(wc -l < "${HIGH_QUALITY_CHECKSUM_FILE}")" "${HIGH_QUALITY_CHECKSUM_FILE}"
 
 URLS=$(get_urls_from_metadata "$ALBUM_ID" "$METADATA")
 URL_FILE="album_${ALBUM_ID}_urls.txt"
 printf "%s\n" "${URLS}" > "${URL_FILE}"
 
-TOTAL_IMAGES=$(wc -l < "$HIGH_QUALITY_CHECKSUM_FILE")
-CURRENT_IMAGE=0
+# Use grep to filter out URLs that do not contain the high quality checksums
+URL_FILE_FILTERED="album_${ALBUM_ID}_urls_filtered.txt"
+grep -Ff "${HIGH_QUALITY_CHECKSUM_FILE}" "${URL_FILE}" > "${URL_FILE_FILTERED}"
+printf "%d URLs saved to %s\n" "$(wc -l < "${URL_FILE_FILTERED}")" "${URL_FILE_FILTERED}"
 
-echo "Total (unique) images to download: ${TOTAL_IMAGES}"
-
-TMP_DIR=$(mktemp -d)
-
-while read -r CHECKSUM; do
-    FOUND=0
-    while read -r URL; do
-        if [[ "${URL}" == *"${CHECKSUM}"* ]]; then
-            FOUND=1
-            curl --output-dir "${TMP_DIR}" -sOJ "${URL}"
-            CURL_EXIT_CODE=$?
-            if [[ ${CURL_EXIT_CODE} -ne 0 ]]; then
-                echo "Warning: Exitcode ${CURL_EXIT_CODE}. Failed to download ${URL}" >&2
-                echo "${URL}" >> "album_${ALBUM_ID}_urls_failed.txt"
-                continue
-            fi
-
-            # Move the downloaded file to the target folder
-            for DOWNLOADED_FILE in "${TMP_DIR}"/*; do
-                DOWNLOADED_FILENAME=$(basename "$DOWNLOADED_FILE")
-                if [ ! -f "${TARGET_FOLDER}/${DOWNLOADED_FILENAME}" ]; then
-                    mv "${DOWNLOADED_FILE}" "${TARGET_FOLDER}/${DOWNLOADED_FILENAME}"
-                    break;
-                fi;
-
-                EXISTING_CHECKSUM=$(md5sum "$TARGET_FOLDER/$DOWNLOADED_FILENAME" | cut -d' ' -f1)
-                NEW_CHECKSUM=$(md5sum "$DOWNLOADED_FILE" | cut -d' ' -f1)
-
-                if [[ "${EXISTING_CHECKSUM}" != "${NEW_CHECKSUM}" ]]; then
-                    echo "File ${DOWNLOADED_FILENAME} checksum found with different checksums, keeping both versions." >&2
-                    mv "${DOWNLOADED_FILE}" "${TARGET_FOLDER}/${DOWNLOADED_FILENAME}.${NEW_CHECKSUM}"
-                    break;
-                fi
-
-                echo "File ${DOWNLOADED_FILENAME} already exists with same checkum, skipping." >&2
-                rm -f "${DOWNLOADED_FILE}"
-            done
-
-            CURRENT_IMAGE=$((CURRENT_IMAGE + 1))
-            progress_bar "${CURRENT_IMAGE}" "${TOTAL_IMAGES}"
-            break
-        fi
-    done < "${URL_FILE}"
-    if [[ ${FOUND} -eq 0 ]]; then
-        echo "Warning: Checksum ${CHECKSUM} not found in URLs." >&2
-    fi
-done < "${HIGH_QUALITY_CHECKSUM_FILE}"
-
-rm -rf "${TMP_DIR}"
+sed 's|^|url = "|; s|$|"|' "${URL_FILE_FILTERED}" | curl --remote-name-all --remote-header-name --no-clobber --parallel --parallel-max "${CONCURRENT}" --parallel-immediate --progress-bar --config -
+CURL_EXIT_CODE="${?}"
+if [[ "${CURL_EXIT_CODE}" -ne 0 ]]; then
+    echo "Error downloading files (error '${CURL_EXIT_CODE}'). Please check your network connection and the URLs." >&2
+    exit 1
+fi
 
 popd > /dev/null || exit 1
 echo -e "\nDownload completed."
